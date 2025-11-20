@@ -7,8 +7,6 @@ compatibility_date = "2024-11-18"
 # 使用 Service Worker 语法（addEventListener）
 workers_dev = true
 
-# 明确指定使用 Service Worker 语法
-compatibility_flags = ["service_worker_bundle"]
 
 # 可选：设置自定义域名（需要先在 Cloudflare 配置）
 # routes = [
