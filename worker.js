@@ -1,14 +1,7 @@
 /**
  * Cloudflare Worker - anyrouter.top 反向代理
- *
- * 功能说明：
- * 1. 接收所有请求并转发到 anyrouter.top
- * 2. 保持原始请求的所有 headers、方法和 body
- * 3. 自动重写 HTML/CSS/JS 中的绝对 URL，确保所有资源都通过代理访问
- * 4. 返回目标网站的响应
  */
 
-// 目标网站地址
 const TARGET_HOST = 'anyrouter.top';
 const TARGET_URL = `https://${TARGET_HOST}`;
 
@@ -16,152 +9,142 @@ addEventListener('fetch', event => {
   event.respondWith(handleRequest(event.request));
 });
 
-/**
- * 处理传入的请求
- * @param {Request} request - 原始请求对象
- * @returns {Response} - 代理后的响应
- */
 async function handleRequest(request) {
   try {
-    // 解析请求的 URL
     const url = new URL(request.url);
-
-    // 调试信息
-    console.log('收到请求:', request.url);
-    console.log('请求方法:', request.method);
-
-    // 构建目标 URL，保持原始路径和查询参数
     const targetUrl = `${TARGET_URL}${url.pathname}${url.search}`;
-    console.log('目标URL:', targetUrl);
 
-    // 复制请求头，并修改 Host 和 Origin
+    // 复制并修改请求头
     const headers = new Headers(request.headers);
     headers.set('Host', TARGET_HOST);
+    
+    // 移除可能引起问题的头
+    headers.delete('cf-connecting-ip');
+    headers.delete('cf-ray');
+    headers.delete('cf-ipcountry');
+    headers.delete('cf-visitor');
 
-    // 如果存在 Origin，也需要修改
+    // 处理 Origin 和 Referer
     if (headers.has('Origin')) {
-      headers.set('Origin', TARGET_URL);
+      const origin = headers.get('Origin');
+      try {
+        const originUrl = new URL(origin);
+        if (originUrl.hostname === new URL(request.url).hostname) {
+          headers.set('Origin', TARGET_URL);
+        }
+      } catch (e) {
+        // 忽略无效的 Origin
+      }
     }
 
-    // 如果存在 Referer，也需要修改
     if (headers.has('Referer')) {
       const referer = headers.get('Referer');
       try {
         const refererUrl = new URL(referer);
-        headers.set('Referer', `${TARGET_URL}${refererUrl.pathname}${refererUrl.search}`);
+        if (refererUrl.hostname === new URL(request.url).hostname) {
+          headers.set('Referer', `${TARGET_URL}${refererUrl.pathname}${refererUrl.search}`);
+        }
       } catch (e) {
-        // 如果 Referer 格式错误，保持不变
+        // 忽略无效的 Referer
       }
     }
 
-    // 构建新的请求选项
+    // 构建请求选项
     const requestOptions = {
       method: request.method,
       headers: headers,
-      // 重要：不自动跟随重定向，避免重定向循环
       redirect: 'manual',
     };
 
-    // 如果请求有 body（POST、PUT 等），需要复制 body
     if (request.method !== 'GET' && request.method !== 'HEAD') {
       requestOptions.body = request.body;
     }
 
-    // 发起代理请求
-    console.log('发起请求到:', targetUrl);
+    // 发起请求
     const response = await fetch(targetUrl, requestOptions);
-    console.log('目标响应状态:', response.status, response.statusText);
 
-    // 手动处理重定向状态码
-    if (response.status === 301 || response.status === 302 || response.status === 303 || response.status === 307 || response.status === 308) {
+    // 改进的重定向处理
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
       const location = response.headers.get('Location');
-      console.log('检测到重定向，Location:', location);
-
-      if (location && !location.startsWith(TARGET_HOST)) {
-        // 如果重定向到其他域名，转发重定向
-        console.log('重定向到外部域名，直接转发');
-        const responseHeaders = new Headers(response.headers);
-        responseHeaders.set('Access-Control-Allow-Origin', '*');
-        responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-        responseHeaders.set('Access-Control-Allow-Headers', '*');
-        responseHeaders.delete('Content-Security-Policy');
-        responseHeaders.delete('X-Frame-Options');
-
-        return new Response(response.body, {
-          status: response.status,
-          statusText: response.statusText,
-          headers: responseHeaders
-        });
-      } else {
-        // 如果重定向到自己网站，返回 200 状态和错误提示
-        console.log('重定向到自己网站，返回提示');
-        return new Response('网站不允许通过代理访问', {
-          status: 200,
-          headers: {
-            'Content-Type': 'text/plain; charset=utf-8',
-            'Access-Control-Allow-Origin': '*'
+      
+      if (location) {
+        try {
+          const locationUrl = new URL(location, TARGET_URL);
+          
+          // 如果重定向到目标网站内部，修改为重定向到代理
+          if (locationUrl.hostname === TARGET_HOST) {
+            const proxyUrl = new URL(request.url);
+            const newLocation = `${proxyUrl.origin}${locationUrl.pathname}${locationUrl.search}`;
+            
+            return new Response(null, {
+              status: response.status,
+              headers: {
+                'Location': newLocation,
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                'Access-Control-Allow-Headers': '*',
+              }
+            });
+          } else {
+            // 外部重定向，直接转发
+            return new Response(null, {
+              status: response.status,
+              headers: {
+                'Location': location,
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                'Access-Control-Allow-Headers': '*',
+              }
+            });
           }
-        });
+        } catch (e) {
+          // 处理相对路径重定向
+          if (location.startsWith('/')) {
+            const proxyUrl = new URL(request.url);
+            const newLocation = `${proxyUrl.origin}${location}`;
+            
+            return new Response(null, {
+              status: response.status,
+              headers: {
+                'Location': newLocation,
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                'Access-Control-Allow-Headers': '*',
+              }
+            });
+          }
+        }
       }
     }
 
-    // 修改响应头，处理 CORS
+    // 处理响应
     const responseHeaders = new Headers(response.headers);
-
-    // 添加 CORS 支持
+    
+    // 设置 CORS
     responseHeaders.set('Access-Control-Allow-Origin', '*');
     responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     responseHeaders.set('Access-Control-Allow-Headers', '*');
-
-    // 删除可能导致问题的安全头
+    
+    // 移除安全头
     responseHeaders.delete('Content-Security-Policy');
     responseHeaders.delete('X-Frame-Options');
+    responseHeaders.delete('X-Content-Type-Options');
 
-    // 获取响应内容类型
     const contentType = responseHeaders.get('content-type') || '';
-    console.log('内容类型:', contentType);
+    const isTextContent = /text\/|application\/javascript|application\/json|application\/xml|font\//.test(contentType);
 
-    // 检查是否是文本内容类型（只有这些才需要 URL 重写）
-    const isTextContent =
-      contentType.includes('text/html') ||
-      contentType.includes('text/javascript') ||
-      contentType.includes('application/javascript') ||
-      contentType.includes('application/x-javascript') ||
-      contentType.includes('text/css') ||
-      contentType.includes('application/json') ||
-      contentType.includes('text/xml') ||
-      contentType.includes('application/xml') ||
-      contentType.includes('application/x-font-ttf') ||
-      contentType.includes('application/vnd.ms-fontobject') ||
-      contentType.includes('font/opentype');
-
-    // 如果是文本内容，需要重写其中的 URL
     if (isTextContent) {
-      try {
-        console.log('尝试读取文本内容...');
-        const text = await response.text();
-        console.log('文本长度:', text.length);
-        const rewrittenText = rewriteUrlsInContent(text, request.url, TARGET_URL);
-        console.log('URL 重写完成，返回响应');
-
-        return new Response(rewrittenText, {
-          status: response.status,
-          statusText: response.statusText,
-          headers: responseHeaders
-        });
-      } catch (error) {
-        // 如果文本转换失败，直接返回原始响应
-        console.error('文本转换失败:', error);
-        return new Response(response.body, {
-          status: response.status,
-          statusText: response.statusText,
-          headers: responseHeaders
-        });
-      }
+      const text = await response.text();
+      const rewrittenText = rewriteUrlsInContent(text, request.url);
+      
+      return new Response(rewrittenText, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: responseHeaders
+      });
     }
 
-    // 对于二进制文件（图片、视频等），直接返回原始响应
-    console.log('直接返回二进制内容');
+    // 二进制内容直接返回
     return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
@@ -169,53 +152,45 @@ async function handleRequest(request) {
     });
 
   } catch (error) {
-    // 错误处理
     console.error('代理请求失败:', error);
-    console.error('错误堆栈:', error.stack);
     return new Response(`代理请求失败: ${error.message}`, {
       status: 500,
       headers: {
-        'Content-Type': 'text/plain; charset=utf-8'
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Access-Control-Allow-Origin': '*'
       }
     });
   }
 }
 
 /**
- * 重写内容中的绝对 URL
- * 将 anyrouter.top 的绝对 URL 替换为相对 URL，使其通过代理访问
- * @param {string} content - 原始内容
- * @param {string} proxyUrl - 代理的 URL
- * @param {string} targetUrl - 目标网站的 URL
- * @returns {string} - 重写后的内容
+ * 改进的 URL 重写函数
  */
-function rewriteUrlsInContent(content, proxyUrl, targetUrl) {
+function rewriteUrlsInContent(content, proxyUrl) {
   try {
-    // 获取代理的 origin (例如: https://any.chaosyn.com)
     const proxyOrigin = new URL(proxyUrl).origin;
-
-    // 使用更精确的正则表达式，避免意外匹配
-    // 转义特殊字符
-    const escapedTargetUrl = TARGET_URL.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const escapedTargetHost = TARGET_HOST.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
     let rewritten = content;
 
-    // 重写绝对 URL: https://anyrouter.top -> https://any.chaosyn.com
+    // 1. 重写完整 URL
     rewritten = rewritten.replace(
-      new RegExp(escapedTargetUrl, 'g'),
+      new RegExp(`https?://${TARGET_HOST}`, 'gi'),
       proxyOrigin
     );
 
-    // 处理协议相对 URL: //anyrouter.top -> //any.chaosyn.com
+    // 2. 重写协议相对 URL
     rewritten = rewritten.replace(
-      new RegExp(`//${escapedTargetHost}(?![\\w])`, 'g'),
+      new RegExp(`//${TARGET_HOST}`, 'gi'),
       `//${new URL(proxyUrl).hostname}`
+    );
+
+    // 3. 重写 JSON 中的 URL（常见于 API 响应）
+    rewritten = rewritten.replace(
+      new RegExp(`"https?://${TARGET_HOST}`, 'gi'),
+      `"${proxyOrigin}`
     );
 
     return rewritten;
   } catch (error) {
-    // 如果重写失败，返回原始内容
     console.error('URL 重写失败:', error);
     return content;
   }
